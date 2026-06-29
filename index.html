@@ -346,7 +346,7 @@ button[style*="background:none"][style*="border:none"]{
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 const { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Cell } = Recharts;
 
 /* ─── Storage ─── */
@@ -381,12 +381,132 @@ function clearLocalPack(key) {
   } catch {}
 }
 
+function tradeHasData(t) {
+  return Object.entries(t).some(([k,v]) =>
+    !["id","mergedCount","source"].includes(k) && v !== "" && v !== null && v !== undefined
+  );
+}
+
 function hasWorkspaceData(session, avoided) {
   const trades = session?.trades || [];
-  const meaningfulTrades = trades.filter(t =>
-    Object.entries(t).some(([k,v]) => k !== "id" && v !== "" && v !== null)
-  );
+  const meaningfulTrades = trades.filter(tradeHasData);
   return meaningfulTrades.length > 0 || avoided.length > 0 || !!session?.sessionNotes;
+}
+
+/* ─── CSV import — broker fill exports → Trade Log (not the archive) ───
+   Stacked fills sharing the same Exit Time are merged into ONE
+   multi-contract trade card. Commission is subtracted automatically:
+   net result = gross P&L − (commission-per-contract × contracts). */
+
+function parseCSVText(text) {
+  const rows = [];
+  let cur = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ",") { cur.push(field); field = ""; }
+      else if (c === "\n" || c === "\r") {
+        if (c === "\r" && text[i+1] === "\n") i++;
+        cur.push(field); rows.push(cur); cur = []; field = "";
+      } else field += c;
+    }
+  }
+  if (field.length || cur.length) { cur.push(field); rows.push(cur); }
+  return rows.filter(r => r.some(c => c && c.trim() !== ""));
+}
+
+function normHeader(h) { return (h||"").trim().toLowerCase().replace(/[^a-z0-9]/g,""); }
+
+const CSV_HEADER_ALIASES = {
+  time:      ["time","entrytime","timeentered","entered","opentime","datetime","filltime"],
+  exitTime:  ["exittime","timeexited","exited","closetime","timeclosed","exitfilltime"],
+  direction: ["direction","side","action","type","buysell","b/s"],
+  entry:     ["entry","entryprice","price","priceentered","fillprice","buyprice"],
+  exit:      ["exit","exitprice","priceexited","sellprice"],
+  contracts: ["contracts","qty","quantity","size","contractcount","numcontracts","amount"],
+  pnl:       ["pnl","p&l","profit","result","netpnl","grosspnl","profitloss","pl","gainloss"],
+  symbol:    ["symbol","instrument","ticker","product"],
+};
+
+function mapCSVHeaders(headerRow) {
+  const norm = headerRow.map(normHeader);
+  const map = {};
+  Object.entries(CSV_HEADER_ALIASES).forEach(([key, aliases]) => {
+    const aliasesNorm = aliases.map(normHeader);
+    const idx = norm.findIndex(h => aliasesNorm.includes(h));
+    if (idx !== -1) map[key] = idx;
+  });
+  return map;
+}
+
+function parseCSVToTrades(text, opts) {
+  const { commissionPerContract = 1.24, pointValue = 2 } = opts || {};
+  const rows = parseCSVText(text);
+  if (rows.length < 2) return { trades: [], errors: ["That CSV looks empty, or is missing a header row."] };
+  const colMap = mapCSVHeaders(rows[0]);
+  if (colMap.entry === undefined && colMap.exit === undefined && colMap.pnl === undefined) {
+    return { trades: [], errors: ["Couldn't find Entry/Exit price or P&L columns in that CSV header row."] };
+  }
+  const dataRows = rows.slice(1);
+
+  const rawFills = dataRows.map(r => {
+    const get = key => colMap[key] !== undefined ? (r[colMap[key]]||"").trim() : "";
+    let direction = get("direction").toUpperCase();
+    if (["BUY","B","LONG","L"].includes(direction)) direction = "LONG";
+    else if (["SELL","S","SHORT","SH"].includes(direction)) direction = "SHORT";
+    const entryPrice = parseFloat(get("entry").replace(/[,$]/g,""));
+    const exitPrice  = parseFloat(get("exit").replace(/[,$]/g,""));
+    const contracts  = parseFloat(get("contracts").replace(/[,$]/g,"")) || 1;
+    const pnlRaw = get("pnl").replace(/[$,]/g,"").replace(/^\((.*)\)$/,"-$1");
+    let grossPnL = pnlRaw !== "" ? parseFloat(pnlRaw) : null;
+    if ((grossPnL === null || isNaN(grossPnL)) && !isNaN(entryPrice) && !isNaN(exitPrice)) {
+      const sign = direction === "SHORT" ? -1 : 1;
+      grossPnL = (exitPrice - entryPrice) * sign * pointValue * contracts;
+    }
+    return {
+      time: get("time"), exitTime: get("exitTime"), direction,
+      entry: get("entry"), exit: get("exit"),
+      contracts, grossPnL: (grossPnL===null||isNaN(grossPnL)) ? null : grossPnL,
+      symbol: get("symbol"),
+    };
+  }).filter(f => f.time || f.exitTime || f.entry || f.exit || f.grossPnL !== null);
+
+  /* Group fills that share an Exit Time — these were stacked contracts */
+  const groups = [];
+  const seen = {};
+  rawFills.forEach(f => {
+    const key = f.exitTime ? `ET::${f.exitTime}` : `ROW::${groups.length}::${Math.random()}`;
+    if (seen[key] === undefined) { seen[key] = groups.length; groups.push([]); }
+    groups[seen[key]].push(f);
+  });
+
+  const trades = groups.map(g => {
+    const contracts = g.reduce((s,f) => s + (f.contracts||1), 0);
+    const grossKnown = g.every(f => f.grossPnL !== null);
+    const grossPnL = grossKnown ? g.reduce((s,f) => s + f.grossPnL, 0) : null;
+    const commission = +(commissionPerContract * contracts).toFixed(2);
+    const net = grossPnL !== null ? +(grossPnL - commission).toFixed(2) : null;
+    const first = g[0], last = g[g.length-1];
+    return {
+      ...emptyTrade(),
+      time: first.time, exitTime: first.exitTime || last.exitTime,
+      direction: first.direction, entry: first.entry, exit: last.exit || first.exit,
+      contracts: String(contracts),
+      grossPnL: grossPnL !== null ? grossPnL.toFixed(2) : "",
+      commission: commission.toFixed(2),
+      result: net !== null ? String(net) : "",
+      mergedCount: g.length,
+      source: "csv",
+    };
+  });
+
+  return { trades, errors: [] };
 }
 async function loadSavedSessions() {
   try {
@@ -536,8 +656,10 @@ const EXIT_OUTCOME_OPTIONS = [
 
 const emptyTrade = () => ({
   id: Date.now() + Math.random(),
-  direction:"", time:"", entry:"", exit:"", result:"",
+  direction:"", time:"", exitTime:"", entry:"", exit:"", result:"",
   contracts:"",
+  grossPnL:"", commission:"",
+  mergedCount:1, source:"manual",
   grade:"", immediateFollowThrough:null, negotiable:null,
   mae:"", mfe:"", why:"", wouldTakeAgain:null,
   marketDid:null, lossTag:"", setupTag:"",
@@ -643,6 +765,17 @@ function TradeCard({trade,index,onChange,onRemove}){
   const isWinner = !isNaN(resultNum) && resultNum >= 0;
   const isLoser  = !isNaN(resultNum) && resultNum < 0;
   const resultColor=isNaN(resultNum)?"text-zinc-400":isWinner?"text-emerald-400":"text-red-400";
+  const hasGross = trade.grossPnL!=="" && !isNaN(parseFloat(trade.grossPnL));
+
+  /* Gross P&L and Commission stay linked — change either one and
+     Net Result (the number used everywhere else in the app) recalculates. */
+  const recalcNet=(grossStr,commStr)=>{
+    const g=parseFloat(grossStr), c=parseFloat(commStr);
+    if(isNaN(g)) return trade.result;
+    return String(+(g-(isNaN(c)?0:c)).toFixed(2));
+  };
+  const updateGross=(val)=>onChange({...trade,grossPnL:val,result:recalcNet(val,trade.commission)});
+  const updateCommission=(val)=>onChange({...trade,commission:val,result:recalcNet(trade.grossPnL,val)});
 
   return(
     <div className="border border-zinc-700 rounded-lg p-5 mb-4 bg-zinc-950">
@@ -651,6 +784,8 @@ function TradeCard({trade,index,onChange,onRemove}){
           <span className="text-zinc-500 font-mono text-sm">TRADE</span>
           <span className="text-white font-mono text-xl font-bold">#{index+1}</span>
           {trade.result!==""&&<span className={`font-mono text-lg font-bold ${resultColor}`}>{resultNum>=0?"+":""}{trade.result}</span>}
+          {trade.mergedCount>1&&<span className="chip-base" style={{padding:"3px 10px",fontSize:"10px",background:"var(--kk-purple)",color:"#fff"}} title="Multiple fills with the same exit time, merged from CSV import">🧩 STACKED ×{trade.mergedCount}</span>}
+          {trade.source==="csv"&&<span style={{fontSize:"9px",color:"#8a8898",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.08em"}} title="Imported from CSV">FROM CSV</span>}
           {/* Exit outcome badge next to trade header */}
           {trade.exitOutcome==="winner"    && <span style={{fontSize:"18px"}} title="Winner">✅</span>}
           {trade.exitOutcome==="manual"    && <span style={{fontSize:"16px"}} title="Manual Exit — Land the Plane">⭐</span>}
@@ -660,20 +795,10 @@ function TradeCard({trade,index,onChange,onRemove}){
         <button onClick={onRemove} style={{background:"none",border:"none",color:"#3f3f46",fontSize:"11px",cursor:"pointer"}} onMouseOver={e=>e.target.style.color="#a1a1aa"} onMouseOut={e=>e.target.style.color="#3f3f46"}>REMOVE</button>
       </div>
 
-      {trade._csvImported&&(
-        <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:6,padding:"8px 12px",marginBottom:12,fontSize:10,fontFamily:"monospace",color:"#86efac",display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
-          <span style={{fontWeight:700}}>📊 CSV import</span>
-          <span>Entry: {trade.entry}</span>
-          <span>Exit: {trade.exit}</span>
-          <span style={{color:"#fde047"}}>Broker: ${parseFloat(trade._brokerPnL||0).toFixed(2)}</span>
-          <span style={{color:"#f87171"}}>Comm: -${(trade._commission||1.24).toFixed(2)}</span>
-          <span style={{color:parseFloat(trade.result)>=0?"#4ade80":"#f87171",fontWeight:700}}>Net: ${parseFloat(trade.result||0).toFixed(2)}</span>
-          <span style={{color:"#64748b"}}>↓ Fill in the qualitative fields below</span>
-        </div>
-      )}
-      {/* Row 1: Time · Direction · Entry · Exit · Contracts */}
-      <div className="grid grid-cols-4 gap-3 mb-4" style={{gridTemplateColumns:"repeat(5,1fr)"}}>
-        <Field label="Time"><Input value={trade.time} onChange={v=>update("time",v)} placeholder="9:41"/></Field>
+      {/* Row 1: Time · Exit Time · Direction · Entry · Exit · Contracts */}
+      <div className="grid grid-cols-4 gap-3 mb-4" style={{gridTemplateColumns:"repeat(6,1fr)"}}>
+        <Field label="Entry Time"><Input value={trade.time} onChange={v=>update("time",v)} placeholder="9:41"/></Field>
+        <Field label="Exit Time" hint="Matching exit times merge into one trade on import"><Input value={trade.exitTime||""} onChange={v=>update("exitTime",v)} placeholder="9:43"/></Field>
         <Field label="Direction">
           <div className="flex gap-2 mt-1">
             <Chip label="LONG"  active={trade.direction==="LONG"}  onClick={()=>update("direction",trade.direction==="LONG" ?"":"LONG")}  color="green"/>
@@ -682,7 +807,7 @@ function TradeCard({trade,index,onChange,onRemove}){
         </Field>
         <Field label="Entry"><Input value={trade.entry} onChange={v=>update("entry",v)} placeholder="21,450"/></Field>
         <Field label="Exit"><Input value={trade.exit} onChange={v=>update("exit",v)} placeholder="21,460"/></Field>
-        <Field label="Contracts" hint="1 contract max"><Input value={trade.contracts||""} onChange={v=>update("contracts",v)} placeholder="1"/></Field>
+        <Field label="Contracts" hint={trade.mergedCount>1?`${trade.mergedCount} stacked fills`:"1 contract max"}><Input value={trade.contracts||""} onChange={v=>update("contracts",v)} placeholder="1"/></Field>
       </div>
 
       {/* Mental Stop — from journal Step 2 */}
@@ -690,13 +815,24 @@ function TradeCard({trade,index,onChange,onRemove}){
         <Input value={trade.mentalStop||""} onChange={v=>update("mentalStop",v)} placeholder="-250"/>
       </Field>
 
-      {/* Result · MAE · MFE */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <Field label="Result ($)" hint={trade._csvImported ? "Net after $"+(trade._commission||1.24).toFixed(2)+" commission (broker: $"+parseFloat(trade._brokerPnL||0).toFixed(2)+")" : "Actual P&L in dollars"}>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <Input value={trade.result} onChange={v=>update("result",v)} placeholder="+50"/>
+      {/* Result · MAE · MFE — Gross P&L and commission auto-calculate Net Result */}
+      <div className="grid grid-cols-3 gap-3 mb-2">
+        <Field label="Gross P&L ($)" hint="Before commission">
+          <Input value={trade.grossPnL||""} onChange={v=>updateGross(v)} placeholder="10.00"/>
+        </Field>
+        <Field label="Commission ($)" hint="MNQ round-trip ≈ $1.24/contract">
+          <div style={{display:"flex",gap:6}}>
+            <Input value={trade.commission||""} onChange={v=>updateCommission(v)} placeholder="1.24"/>
+            <button type="button" onClick={()=>updateCommission((1.24*(parseFloat(trade.contracts)||1)).toFixed(2))}
+              title="Fill MNQ commission for current contract count"
+              style={{flex:"0 0 auto",background:"none",border:"1.5px dashed var(--kk-ink)",borderRadius:"8px",padding:"0 10px",fontSize:"10px",color:"#6f6d80"}}>AUTO</button>
           </div>
         </Field>
+        <Field label="Result ($) — Net" hint={hasGross?"Auto: Gross − Commission":"Actual P&L in dollars"}>
+          <Input value={trade.result} onChange={v=>update("result",v)} placeholder="+8.76"/>
+        </Field>
+      </div>
+      <div className="grid grid-cols-2 gap-3 mb-4">
         <Field label="MAE (pts)" hint="How far against you before resolution — TIER 1"><Input value={trade.mae} onChange={v=>update("mae",v)} placeholder="8"/></Field>
         <Field label="MFE (pts)" hint="How far in your favor before exit"><Input value={trade.mfe} onChange={v=>update("mfe",v)} placeholder="12"/></Field>
       </div>
@@ -1277,21 +1413,6 @@ function AnalyticsDashboard({historicalSessions}){
 
         {/* ── OVERVIEW ── */}
         {dashView==="overview"&&<>
-          {(()=>{
-            const ct=allTrades.filter(function(t){return t._csvImported;});
-            if(ct.length===0)return null;
-            const totalComm=ct.reduce(function(s,t){return s+(t._commission||1.24);},0);
-            const brokerTotal=ct.reduce(function(s,t){return s+parseFloat(t._brokerPnL||0);},0);
-            return(
-              <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:8,padding:"10px 16px",marginBottom:16,fontFamily:"monospace",fontSize:10,color:"#86efac",display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
-                <span style={{color:"#4ade80",fontWeight:700}}>📊 {ct.length} CSV trades</span>
-                <span>Broker gross: <b style={{color:"#fde047"}}>${brokerTotal.toFixed(2)}</b></span>
-                <span>Total commission: <b style={{color:"#f87171"}}>-${totalComm.toFixed(2)}</b></span>
-                <span>Net kept: <b style={{color:totalPnL>=0?"#4ade80":"#f87171"}}>${(brokerTotal-totalComm).toFixed(2)}</b></span>
-                <span style={{color:"#64748b"}}>$0.62/side × 2 = $1.24/round trip</span>
-              </div>
-            );
-          })()}
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:16}}>
             <Stat label="NET P&L ($)" value={`${totalPnL>=0?"+":""}${totalPnL.toFixed(0)}`} color={totalPnL>=0?C.green:C.red} sub={`${historicalSessions.length} sessions`}/>
             <Stat label="WIN RATE" value={`${winRate}%`} sub={`${winners.length}W / ${losers.length}L`} color={parseFloat(winRate)>=55?C.green:parseFloat(winRate)>=45?C.yellow:C.red}/>
@@ -1614,6 +1735,11 @@ function KaizenTradeTemplate(){
   const [draftLoaded,setDraftLoaded]=useState(false);
   const [booting,setBooting]=useState(true);
   const [celebrate,setCelebrate]=useState(false);
+  const [csvCommission,setCsvCommission]=useState("1.24");
+  const [csvPointValue,setCsvPointValue]=useState("2");
+  const [importMsg,setImportMsg]=useState("");
+  const fileInputCSV=useRef(null);
+  const fileInputDraft=useRef(null);
 
 
   useEffect(()=>{
@@ -1658,109 +1784,81 @@ function KaizenTradeTemplate(){
     }
   };
 
+  /* Save Draft → downloads a .json file to the device (so it survives even if
+     the browser's local storage is cleared on an iPad), and also keeps a
+     local copy for quick reload in this same browser. */
   const saveDraft=()=>{
+    if(!window.confirm("Save your current workspace to a draft file? You'll be able to import it back in later if anything gets lost.")) return;
     saveLocalPack(DRAFT_KEY, session, avoided);
     saveLocalPack(BACKUP_KEY, session, avoided);
+    try{
+      const payload={app:"kaizen-trade-quest",version:"draft-v2",exportedAt:new Date().toISOString(),session,avoided};
+      const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url; a.download=`kaizen-draft-${session.date||"session"}.json`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }catch(e){ console.error("Draft file export failed",e); }
     setDraftSaved(true);
     setDraftLoaded(false);
     sfx("save");
     setTimeout(()=>setDraftSaved(false),3000);
   };
 
+  /* Load Draft → opens the file picker. Falls back to the local in-browser
+     copy only if the person cancels the picker and one exists. */
   const loadDraft=()=>{
-    const draft = loadLocalPack(DRAFT_KEY);
-    if(!draft){
-      window.alert("No saved draft found.");
-      return;
-    }
-    if(hasWorkspaceData(session, avoided) && !window.confirm("Load saved draft? Current workspace will be replaced.")){
-      return;
-    }
-    setSession(draft.session || emptySession());
-    setAvoided(draft.avoided || []);
-    setDraftLoaded(true);
-    setDraftSaved(false);
-    sfx("open");
-    setTimeout(()=>setDraftLoaded(false),3000);
-    setView("session");
+    if(fileInputDraft.current) fileInputDraft.current.click();
   };
 
-  const MNQ_COMMISSION_RT = 1.24;
-
-  const doImportCSV=(e)=>{
-    const file = e.target.files[0];
+  const handleDraftFile=(file)=>{
     if(!file) return;
-    const reader = new FileReader();
-    reader.onload=(ev)=>{
+    if(hasWorkspaceData(session, avoided) && !window.confirm("Import this draft file? Everything currently in your workspace will be replaced.")) return;
+    const reader=new FileReader();
+    reader.onload=(e)=>{
       try{
-        const text = ev.target.result;
-        const rawLines = text.split(/[\r\n]+/).filter(function(l){return l.trim();});
-        if(rawLines.length < 2){ window.alert("CSV appears empty."); return; }
-        const headers = rawLines[0].split(',').map(function(h){return h.trim().replace(/^"|"$/g,'');});
-        const rows = rawLines.slice(1).map(function(line){
-          const cols=[]; let cur='', inQ=false;
-          for(let ci=0;ci<line.length;ci++){
-            if(line[ci]==='"'){inQ=!inQ;}
-            else if(line[ci]===','&&!inQ){cols.push(cur);cur='';}
-            else cur+=line[ci];
-          }
-          cols.push(cur);
-          const obj={};
-          headers.forEach(function(h,hi){ obj[h]=(cols[hi]||'').replace(/^"|"$/g,''); });
-          return obj;
-        }).filter(function(r){return r.EnteredAt||r.EntryPrice;});
-        if(rows.length===0){ window.alert("No valid trades found. Expected columns: EnteredAt, EntryPrice, ExitPrice, PnL, Type, Size."); return; }
-        const byDay={};
-        rows.forEach(function(r){
-          const raw=r.TradeDay||r.EnteredAt||'';
-          const day=raw.slice(0,10);
-          if(!byDay[day])byDay[day]=[];
-          byDay[day].push(r);
-        });
-        const newSessions=Object.entries(byDay).sort().map(function(entry){
-          const day=entry[0], dayTrades=entry[1];
-          const sessionTrades=dayTrades.map(function(r){
-            const enteredAt=r.EnteredAt||'';
-            const timeParts=enteredAt.match(/([0-9]{2}:[0-9]{2})/);
-            const timeStr=timeParts?timeParts[1]:'';
-            const pnlRaw=parseFloat(r.PnL||r.pnl||0);
-            const pnlNet=(pnlRaw - MNQ_COMMISSION_RT).toFixed(2);
-            const dir=(r.Type||r.type||'').toLowerCase();
-            return Object.assign({}, emptyTrade(), {
-              id: Date.now()+Math.random(),
-              time: timeStr,
-              entry: r.EntryPrice||r.entryPrice||'',
-              exit: r.ExitPrice||r.exitPrice||'',
-              contracts: r.Size||r.size||'1',
-              result: pnlNet,
-              direction: dir==='long'?'LONG':dir==='short'?'SHORT':'',
-              _csvImported: true,
-              _brokerPnL: pnlRaw,
-              _commission: MNQ_COMMISSION_RT,
-            });
-          });
-          return Object.assign({}, emptySession(), {
-            id: Date.now()+Math.random(),
-            date: day,
-            trades: sessionTrades,
-            _csvImported: true,
-          });
-        });
-        const msg = "Import " + newSessions.length + " day(s) / " + rows.length + " trade(s) from CSV?\n\nCommission $" + MNQ_COMMISSION_RT + " ($0.62/side x2) auto-deducted per trade.\nExisting sessions kept.";
-        if(!window.confirm(msg)){ e.target.value=''; return; }
-        const merged = history.concat(newSessions);
-        setHistory(merged);
-        saveAllSessions(merged);
-        sfx('save');
-        setView('dashboard');
-        window.alert("Imported " + newSessions.length + " session(s), " + rows.length + " trade(s). Net P&L shown after $" + MNQ_COMMISSION_RT + " commission.");
-      } catch(err){
-        window.alert("CSV import failed: "+err.message);
+        const data=JSON.parse(e.target.result);
+        setSession(data.session || emptySession());
+        setAvoided(data.avoided || []);
+        setDraftLoaded(true);
+        setDraftSaved(false);
+        sfx("open");
+        setTimeout(()=>setDraftLoaded(false),3000);
+        setView("session");
+      }catch(err){
+        window.alert("Couldn't read that file — make sure it's a Kaizen draft .json export.");
       }
     };
     reader.readAsText(file);
-    e.target.value='';
   };
+
+  /* CSV Import → parses broker fill exports straight into the Trade Log
+     (never into the archived dashboard). Fills sharing an Exit Time are
+     merged into one multi-contract trade. Commission auto-applies. */
+  const handleCSVFile=(file)=>{
+    if(!file) return;
+    const reader=new FileReader();
+    reader.onload=(e)=>{
+      const commissionPerContract=parseFloat(csvCommission)||1.24;
+      const pointValue=parseFloat(csvPointValue)||2;
+      const {trades:imported,errors}=parseCSVToTrades(e.target.result,{commissionPerContract,pointValue});
+      if(errors.length){ window.alert(errors.join("\n")); return; }
+      if(imported.length===0){ window.alert("No trades were found in that CSV."); return; }
+      const stackedGroups=imported.filter(t=>t.mergedCount>1).length;
+      if(!window.confirm(`Import ${imported.length} trade${imported.length>1?"s":""} into the Trade Log${stackedGroups?` (${stackedGroups} stacked into multi-contract trades)`:""}? They'll be added to today's log, not the archive.`)) return;
+      setSession(prev=>{
+        const keep=prev.trades.filter(tradeHasData);
+        return {...prev, trades:[...keep, ...imported]};
+      });
+      setImportMsg(`✓ Imported ${imported.length} trade(s) from CSV${stackedGroups?`, merged ${stackedGroups} stacked group(s)`:""}.`);
+      sfx("save");
+      setTimeout(()=>setImportMsg(""),6000);
+      setView("session");
+    };
+    reader.readAsText(file);
+  };
+
 
   const switchView=(v)=>{ sfx("open"); setView(v); };
 
@@ -1778,24 +1876,37 @@ function KaizenTradeTemplate(){
       <BackgroundDecor/>
       {celebrate&&<Confetti/>}
       {/* ── Header ── */}
-      <div style={{borderBottom:"1px solid #27272a",padding:"16px 24px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div>
-          <div style={{color:"#71717a",fontSize:"10px",letterSpacing:"0.2em",marginBottom:"2px"}}>KAIZEN TRADE QUEST</div>
-          <div style={{color:"#e4e4e7",fontSize:"18px",fontWeight:"700",letterSpacing:"0.05em"}}>SESSION LOG v5.0</div>
+      <input ref={fileInputDraft} type="file" accept=".json,application/json" style={{display:"none"}}
+        onChange={e=>{handleDraftFile(e.target.files[0]); e.target.value="";}}/>
+      <div style={{borderBottom:"1px solid #27272a",padding:"16px 24px 12px"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px",flexWrap:"wrap",gap:"8px"}}>
+          <div>
+            <div style={{color:"#71717a",fontSize:"10px",letterSpacing:"0.2em",marginBottom:"2px"}}>KAIZEN TRADE QUEST</div>
+            <div style={{color:"#e4e4e7",fontSize:"18px",fontWeight:"700",letterSpacing:"0.05em"}}>SESSION LOG v5.0</div>
+          </div>
+          <div style={{display:"flex",gap:"10px",flexWrap:"wrap",alignItems:"center"}}>
+            {saved&&<span style={{color:"#10b981",fontSize:10,fontFamily:"monospace"}}>✓ ARCHIVED</span>}
+            {draftSaved&&<span style={{color:"#eab308",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT SAVED TO FILE</span>}
+            {draftLoaded&&<span style={{color:"#6366f1",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT LOADED</span>}
+            <button onClick={()=>switchView("session")} style={{...hdrBtn,borderColor:view==="session"?"#2563ff":"#3f3f46",color:view==="session"?"#fff":"#a1a1aa"}}>LOG WORKSPACE</button>
+            <button onClick={()=>switchView("summary")} style={{...hdrBtn,borderColor:view==="summary"?"#2563ff":"#3f3f46",color:view==="summary"?"#fff":"#a1a1aa"}}>VIEW SUMMARY</button>
+            <button onClick={()=>switchView("dashboard")} style={{...hdrBtn,borderColor:view==="dashboard"?"#2563ff":"#3f3f46",color:view==="dashboard"?"#fff":"#a1a1aa"}}>ANALYTICS DASHBOARD</button>
+          </div>
         </div>
-        <div style={{display:"flex",gap:"8px",flexWrap:"wrap",alignItems:"center"}}>
-          {saved&&<span style={{color:"#10b981",fontSize:10,fontFamily:"monospace"}}>✓ ARCHIVED</span>}
-          {draftSaved&&<span style={{color:"#eab308",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT SAVED</span>}
-          {draftLoaded&&<span style={{color:"#6366f1",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT LOADED</span>}
-          <button id="print-btn" onClick={()=>{sfx("tap");window.print();}} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>⬇ PRINT / SAVE PDF</button>
-          <button onClick={saveDraft} style={{...hdrBtn,borderColor:"#eab308",color:"#fde047"}}>SAVE DRAFT</button>
-          <button onClick={loadDraft} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>LOAD DRAFT</button>
-          <button onClick={()=>switchView("session")} style={{...hdrBtn,borderColor:view==="session"?"#2563ff":"#3f3f46",color:view==="session"?"#fff":"#a1a1aa"}}>LOG WORKSPACE</button>
-          <button onClick={()=>switchView("summary")} style={{...hdrBtn,borderColor:view==="summary"?"#2563ff":"#3f3f46",color:view==="summary"?"#fff":"#a1a1aa"}}>VIEW SUMMARY</button>
-          <button onClick={()=>switchView("dashboard")} style={{...hdrBtn,borderColor:view==="dashboard"?"#2563ff":"#3f3f46",color:view==="dashboard"?"#fff":"#a1a1aa"}}>ANALYTICS DASHBOARD</button>
-          <button id="archive-btn" onClick={commitSessionToHistory} style={{...hdrBtn,borderColor:"#10b981",color:"#6ee7b7"}}>ARCHIVE SESSION</button>
-          <label style={{...hdrBtn,borderColor:"#34d399",color:"#6ee7b7",cursor:"pointer",display:"inline-block"}}>📊 IMPORT CSV<input type="file" accept=".csv" onChange={doImportCSV} style={{display:"none"}}/></label>
-          <button onClick={resetSession} style={{...hdrBtn,color:"#71717a"}}>NEW SESSION</button>
+        {/* Action row — Save Draft sits at the far left, Archive Session at the
+            far right, on purpose, so the two are never mistaken for each other. */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:"10px"}}>
+          <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+            <button onClick={saveDraft} style={{...hdrBtn,borderColor:"#eab308",color:"#fde047"}}>💾 SAVE DRAFT TO FILE</button>
+            <button onClick={loadDraft} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>📂 LOAD DRAFT FROM FILE</button>
+          </div>
+          <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+            <button id="print-btn" onClick={()=>{sfx("tap");window.print();}} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>⬇ PRINT / SAVE PDF</button>
+          </div>
+          <div style={{display:"flex",gap:"8px",flexWrap:"wrap"}}>
+            <button id="archive-btn" onClick={commitSessionToHistory} style={{...hdrBtn,borderColor:"#10b981",color:"#6ee7b7"}}>ARCHIVE SESSION</button>
+            <button onClick={resetSession} style={{...hdrBtn,color:"#71717a"}}>NEW SESSION</button>
+          </div>
         </div>
       </div>
 
@@ -1881,15 +1992,52 @@ function KaizenTradeTemplate(){
             {/* TRADE LOG */}
             <div style={{marginBottom:"8px",color:"#71717a",fontSize:"10px",letterSpacing:"0.2em"}}>TRADE LOG — 1 CONTRACT MAX · MANTRA AFTER EVERY TRADE</div>
             <div style={{color:"#52525b",fontSize:"9px",fontStyle:"italic",marginBottom:"12px"}}>Symbol key: ✅ = Winner · ⭐ = Manual Exit (Land the Plane) · ⏹ = Small Stop · 🔺 = Hard Stop</div>
+
+            {/* Rapid CSV Import — builds trade cards straight into the Trade Log above, never the archive */}
+            <input ref={fileInputCSV} type="file" accept=".csv,text/csv" style={{display:"none"}}
+              onChange={e=>{handleCSVFile(e.target.files[0]); e.target.value="";}}/>
+            <div style={{border:"1px dashed #3f3f46",borderRadius:"8px",padding:"14px 16px",marginBottom:"16px",background:"#0f0f12"}}>
+              <div style={{color:"#71717a",fontSize:"10px",letterSpacing:"0.15em",marginBottom:"8px"}}>⚡ RAPID ENTRY — IMPORT CSV</div>
+              <div style={{color:"#52525b",fontSize:"10px",fontStyle:"italic",marginBottom:"10px"}}>
+                Drops one trade card per CSV row into the Trade Log below (not the archive). Fills sharing the same Exit Time are merged into one multi-contract trade. You can still add notes, tags, and grades to each card by hand afterward.
+              </div>
+              <div style={{display:"flex",gap:"10px",flexWrap:"wrap",alignItems:"flex-end"}}>
+                <div>
+                  <div style={{color:"#71717a",fontSize:"9px",marginBottom:"4px"}}>COMMISSION / CONTRACT ($)</div>
+                  <Input value={csvCommission} onChange={setCsvCommission} placeholder="1.24" small/>
+                </div>
+                <div>
+                  <div style={{color:"#71717a",fontSize:"9px",marginBottom:"4px"}}>$/POINT (fallback only)</div>
+                  <Input value={csvPointValue} onChange={setCsvPointValue} placeholder="2" small/>
+                </div>
+                <button onClick={()=>fileInputCSV.current&&fileInputCSV.current.click()}
+                  style={{background:"var(--kk-blue)",color:"#fff",border:"2.5px solid var(--kk-ink)",borderRadius:"10px",padding:"10px 18px",fontSize:"12px",fontWeight:700,boxShadow:"var(--kk-shadow-sm)"}}>
+                  📥 IMPORT CSV
+                </button>
+              </div>
+              <div style={{color:"#52525b",fontSize:"9px",marginTop:"8px"}}>
+                Expected columns (any order, header names flexible): Time, Exit Time, Direction, Entry, Exit, Contracts, P&L. MNQ default: $1.24 commission per contract round-trip — e.g. a $10 stop becomes +$8.76 net automatically.
+              </div>
+              {importMsg&&<div style={{color:"#6ee7b7",fontSize:11,marginTop:"8px",fontFamily:"monospace"}}>{importMsg}</div>}
+            </div>
+
             {session.trades.map((trade,i)=>(
               <TradeCard key={trade.id} trade={trade} index={i} onChange={updated=>updateTrade(trade.id,updated)} onRemove={()=>removeTrade(trade.id)}/>
             ))}
-            <button onClick={addTrade}
-              style={{width:"100%",background:"none",border:"1px dashed #3f3f46",color:"#52525b",padding:"12px",borderRadius:"8px",fontSize:"12px",cursor:"pointer",marginBottom:"24px"}}
-              onMouseOver={e=>{e.target.style.borderColor="#a1a1aa";e.target.style.color="#a1a1aa";}}
-              onMouseOut={e=>{e.target.style.borderColor="#3f3f46";e.target.style.color="#52525b";}}>
-              + ADD TRADE TO LOG
-            </button>
+            <div style={{display:"flex",gap:"10px",marginBottom:"24px"}}>
+              <button onClick={addTrade}
+                style={{flex:1,background:"none",border:"1px dashed #3f3f46",color:"#52525b",padding:"12px",borderRadius:"8px",fontSize:"12px",cursor:"pointer"}}
+                onMouseOver={e=>{e.target.style.borderColor="#a1a1aa";e.target.style.color="#a1a1aa";}}
+                onMouseOut={e=>{e.target.style.borderColor="#3f3f46";e.target.style.color="#52525b";}}>
+                + ADD TRADE TO LOG
+              </button>
+              <button onClick={saveDraft}
+                style={{flex:"0 0 180px",background:"none",border:"1px dashed #eab308",color:"#eab308",padding:"12px",borderRadius:"8px",fontSize:"12px",cursor:"pointer"}}
+                onMouseOver={e=>{e.target.style.background="#1c1606";}}
+                onMouseOut={e=>{e.target.style.background="none";}}>
+                💾 SAVE DRAFT
+              </button>
+            </div>
 
             {/* Trades Avoided */}
             <TradesAvoided avoided={avoided} setAvoided={setAvoided}/>
@@ -1949,7 +2097,7 @@ function KaizenTradeTemplate(){
 
         {/* Footer */}
         <div style={{marginTop:"32px",borderTop:"1px solid #27272a",paddingTop:"16px",color:"#52525b",fontSize:"10px",textAlign:"center"}}>
-          Kaizen Log v4.1.3 · ✅ Winner · ⭐ Manual Exit · ⏹ Small Stop · 🔺 Hard Stop · The account staying open is the win condition.
+          Kaizen Log v4.2.0 · ✅ Winner · ⭐ Manual Exit · ⏹ Small Stop · 🔺 Hard Stop · CSV import + MNQ commission auto-calc · The account staying open is the win condition.
         </div>
       </div>
     </div>
