@@ -132,7 +132,6 @@ input::placeholder,textarea::placeholder{color:#b9b4c4;}
 textarea.field-input{resize:none;font-family:'Baloo 2',sans-serif;}
 input[type="date"].field-input{font-family:'Baloo 2',sans-serif;}
 
-.csv-banner{background:#052e16;border:1px solid #166534;border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:10px;font-family:monospace;color:#86efac;display:flex;gap:12px;flex-wrap:wrap;align-items:center;}
 /* ── Generic button skin (header buttons, add-trade, etc.) ── */
 button{
   font-family:'Baloo 2',sans-serif;font-weight:700;
@@ -389,32 +388,24 @@ function hasWorkspaceData(session, avoided) {
   );
   return meaningfulTrades.length > 0 || avoided.length > 0 || !!session?.sessionNotes;
 }
-function loadSavedSessions() {
+async function loadSavedSessions() {
   try {
+    if (window.storage && typeof window.storage.get === 'function') {
+      const r = await window.storage.get(SESSIONS_KEY);
+      return r ? JSON.parse(r.value) : [];
+    }
     const local = localStorage.getItem(SESSIONS_KEY);
     return local ? JSON.parse(local) : [];
   } catch { return []; }
 }
-function saveAllSessions(list) {
-  try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(list)); }
-  catch(e) { console.error("Storage save failed", e); }
-}
-function exportBackupFile(history, session, avoided) {
-  const payload = {
-    exportedAt: new Date().toISOString(),
-    version: 1,
-    sessions: history,
-    draft: { session, avoided }
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:"application/json"});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "kaizen-backup-" + new Date().toISOString().slice(0,10) + ".json";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+async function saveAllSessions(list) {
+  try {
+    if (window.storage && typeof window.storage.set === 'function') {
+      await window.storage.set(SESSIONS_KEY, JSON.stringify(list));
+    } else {
+      localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
+    }
+  } catch(e) { console.error("Storage save failed", e); }
 }
 
 /* ─── Sound effects (tiny synthesized chiptune blips — Web Audio, no samples) ─── */
@@ -666,21 +657,18 @@ function TradeCard({trade,index,onChange,onRemove}){
           {trade.exitOutcome==="smallStop" && <span style={{fontSize:"16px"}} title="Small Stop">⏹</span>}
           {trade.exitOutcome==="hardStop"  && <span style={{fontSize:"16px"}} title="Hard Stop">🔺</span>}
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:8}}>
-          {trade._csvImported&&<span style={{fontSize:"9px",background:"#064e3b",color:"#6ee7b7",border:"1px solid #10b981",borderRadius:4,padding:"2px 7px",fontFamily:"monospace",letterSpacing:"0.1em"}}>CSV · {trade.contracts||1}ct · ${(trade._commission||1.24).toFixed(2)} comm</span>}
-          <button onClick={onRemove} style={{background:"none",border:"none",color:"#3f3f46",fontSize:"11px",cursor:"pointer"}} onMouseOver={e=>e.target.style.color="#a1a1aa"} onMouseOut={e=>e.target.style.color="#3f3f46"}>REMOVE</button>
-        </div>
+        <button onClick={onRemove} style={{background:"none",border:"none",color:"#3f3f46",fontSize:"11px",cursor:"pointer"}} onMouseOver={e=>e.target.style.color="#a1a1aa"} onMouseOut={e=>e.target.style.color="#3f3f46"}>REMOVE</button>
       </div>
 
       {trade._csvImported&&(
-        <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:6,padding:"8px 12px",marginBottom:12,fontSize:10,fontFamily:"monospace",color:"#86efac",display:"flex",gap:16,flexWrap:"wrap"}}>
-          <span>📊 Auto-filled from CSV</span>
+        <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:6,padding:"8px 12px",marginBottom:12,fontSize:10,fontFamily:"monospace",color:"#86efac",display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{fontWeight:700}}>📊 CSV import</span>
           <span>Entry: {trade.entry}</span>
           <span>Exit: {trade.exit}</span>
-          <span style={{color:"#fde047"}}>Broker P&L: ${parseFloat(trade._brokerPnL||0).toFixed(2)}</span>
-          <span style={{color:"#f87171"}}>Commission: -${(trade._commission||1.24).toFixed(2)}</span>
+          <span style={{color:"#fde047"}}>Broker: ${parseFloat(trade._brokerPnL||0).toFixed(2)}</span>
+          <span style={{color:"#f87171"}}>Comm: -${(trade._commission||1.24).toFixed(2)}</span>
           <span style={{color:parseFloat(trade.result)>=0?"#4ade80":"#f87171",fontWeight:700}}>Net: ${parseFloat(trade.result||0).toFixed(2)}</span>
-          <span style={{color:"#94a3b8"}}>Complete the qualitative fields below ↓</span>
+          <span style={{color:"#64748b"}}>↓ Fill in the qualitative fields below</span>
         </div>
       )}
       {/* Row 1: Time · Direction · Entry · Exit · Contracts */}
@@ -704,7 +692,7 @@ function TradeCard({trade,index,onChange,onRemove}){
 
       {/* Result · MAE · MFE */}
       <div className="grid grid-cols-3 gap-3 mb-4">
-        <Field label="Result ($)" hint={trade._csvImported ? `Net after $${(trade._commission||1.24).toFixed(2)} commission (broker: $${parseFloat(trade._brokerPnL||0).toFixed(2)})` : "Actual P&L in dollars — commission NOT auto-deducted for manual entries"}>
+        <Field label="Result ($)" hint={trade._csvImported ? "Net after $"+(trade._commission||1.24).toFixed(2)+" commission (broker: $"+parseFloat(trade._brokerPnL||0).toFixed(2)+")" : "Actual P&L in dollars"}>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <Input value={trade.result} onChange={v=>update("result",v)} placeholder="+50"/>
           </div>
@@ -1289,17 +1277,17 @@ function AnalyticsDashboard({historicalSessions}){
 
         {/* ── OVERVIEW ── */}
         {dashView==="overview"&&<>
-          {(() => {
-            const csvTrades = allTrades.filter(t=>t._csvImported);
-            const totalComm = csvTrades.reduce((s,t)=>s+(t._commission||1.24),0);
-            const brokerTotal = csvTrades.reduce((s,t)=>s+parseFloat(t._brokerPnL||0),0);
-            if(csvTrades.length===0) return null;
-            return (
-              <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:8,padding:"10px 16px",marginBottom:16,fontFamily:"monospace",fontSize:10,color:"#86efac",display:"flex",gap:20,flexWrap:"wrap",alignItems:"center"}}>
-                <span style={{color:"#4ade80",fontWeight:700}}>📊 {csvTrades.length} CSV-imported trades</span>
+          {(()=>{
+            const ct=allTrades.filter(function(t){return t._csvImported;});
+            if(ct.length===0)return null;
+            const totalComm=ct.reduce(function(s,t){return s+(t._commission||1.24);},0);
+            const brokerTotal=ct.reduce(function(s,t){return s+parseFloat(t._brokerPnL||0);},0);
+            return(
+              <div style={{background:"#052e16",border:"1px solid #166534",borderRadius:8,padding:"10px 16px",marginBottom:16,fontFamily:"monospace",fontSize:10,color:"#86efac",display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+                <span style={{color:"#4ade80",fontWeight:700}}>📊 {ct.length} CSV trades</span>
                 <span>Broker gross: <b style={{color:"#fde047"}}>${brokerTotal.toFixed(2)}</b></span>
                 <span>Total commission: <b style={{color:"#f87171"}}>-${totalComm.toFixed(2)}</b></span>
-                <span>Net (what you keep): <b style={{color:totalPnL>=0?"#4ade80":"#f87171"}}>${(brokerTotal-totalComm).toFixed(2)}</b></span>
+                <span>Net kept: <b style={{color:totalPnL>=0?"#4ade80":"#f87171"}}>${(brokerTotal-totalComm).toFixed(2)}</b></span>
                 <span style={{color:"#64748b"}}>$0.62/side × 2 = $1.24/round trip</span>
               </div>
             );
@@ -1629,7 +1617,7 @@ function KaizenTradeTemplate(){
 
 
   useEffect(()=>{
-    setHistory(loadSavedSessions());
+    loadSavedSessions().then(data=>setHistory(data));
   },[]);
   useEffect(()=>{
     if(hasWorkspaceData(session, avoided)){
@@ -1642,11 +1630,11 @@ function KaizenTradeTemplate(){
   const updateTrade=(id,upd)=>setSession(prev=>({...prev,trades:prev.trades.map(t=>t.id===id?upd:t)}));
   const removeTrade=(id)=>{ sfx("remove"); setSession(prev=>({...prev,trades:prev.trades.filter(t=>t.id!==id)})); };
 
-  const commitSessionToHistory=()=>{
-    if(window.confirm("Archive this session? It will be saved to your dashboard and the workspace will reset.")){
+  const commitSessionToHistory=async()=>{
+    if(window.confirm("Commit current logs to analytics archive and reset workspace?")){
       const updated=[...history,{...session,id:session.id||Date.now(),avoidedSetups:avoided}];
       setHistory(updated);
-      saveAllSessions(updated);
+      await saveAllSessions(updated);
       clearLocalPack(DRAFT_KEY);
       clearLocalPack(BACKUP_KEY);
       setSession(emptySession());
@@ -1657,7 +1645,6 @@ function KaizenTradeTemplate(){
       setTimeout(()=>setSaved(false),3000);
       setTimeout(()=>setCelebrate(false),1900);
       setView("dashboard");
-      window.alert("✅ Session archived successfully!");
     }
   };
 
@@ -1678,7 +1665,6 @@ function KaizenTradeTemplate(){
     setDraftLoaded(false);
     sfx("save");
     setTimeout(()=>setDraftSaved(false),3000);
-    window.alert("✅ Draft saved!");
   };
 
   const loadDraft=()=>{
@@ -1699,44 +1685,6 @@ function KaizenTradeTemplate(){
     setView("session");
   };
 
-  const doExportBackup=()=>{
-    exportBackupFile(history, session, avoided);
-    window.alert("✅ Backup file downloaded! Save it to iCloud or Google Drive to keep your data safe.");
-  };
-
-  const doImportBackup=(e)=>{
-    const file = e.target.files[0];
-    if(!file) return;
-    const reader = new FileReader();
-    reader.onload=(ev)=>{
-      try{
-        const payload = JSON.parse(ev.target.result);
-        const sessionList = Array.isArray(payload.sessions) ? payload.sessions : [];
-        const hasDraft = payload.draft && payload.draft.session;
-        if(!window.confirm("Import backup? This replaces your current archived sessions.\n\n• "+sessionList.length+" archived session(s)
-"+(hasDraft?"• Saved workspace will be restored
-":""))) {
-          e.target.value=""; return;
-        }
-        saveAllSessions(sessionList);
-        setHistory(sessionList);
-        if(hasDraft){
-          saveLocalPack(DRAFT_KEY, payload.draft.session, payload.draft.avoided||[]);
-          saveLocalPack(BACKUP_KEY, payload.draft.session, payload.draft.avoided||[]);
-          setSession(payload.draft.session);
-          setAvoided(payload.draft.avoided||[]);
-        }
-        sfx("open");
-        setView(sessionList.length>0?"dashboard":"session");
-        window.alert("✅ Imported! "+sessionList.length+" session(s) restored."+(hasDraft?" Workspace restored.":""));
-      } catch(err){
-        window.alert("❌ Import failed: "+err.message);
-      }
-    };
-    reader.readAsText(file);
-    e.target.value="";
-  };
-
   const MNQ_COMMISSION_RT = 1.24;
 
   const doImportCSV=(e)=>{
@@ -1746,12 +1694,11 @@ function KaizenTradeTemplate(){
     reader.onload=(ev)=>{
       try{
         const text = ev.target.result;
-        const lines = text.split(/[\r\n]+/).filter(function(l){return l.trim();});
-        if(lines.length < 2){ window.alert("CSV appears empty."); return; }
-        const headers = lines[0].split(',').map(function(h){return h.trim().replace(/^"|"$/g,'');});
-        const rows = lines.slice(1).map(function(line){
-          const cols=[];
-          let cur='', inQ=false;
+        const rawLines = text.split(/[\r\n]+/).filter(function(l){return l.trim();});
+        if(rawLines.length < 2){ window.alert("CSV appears empty."); return; }
+        const headers = rawLines[0].split(',').map(function(h){return h.trim().replace(/^"|"$/g,'');});
+        const rows = rawLines.slice(1).map(function(line){
+          const cols=[]; let cur='', inQ=false;
           for(let ci=0;ci<line.length;ci++){
             if(line[ci]==='"'){inQ=!inQ;}
             else if(line[ci]===','&&!inQ){cols.push(cur);cur='';}
@@ -1762,9 +1709,7 @@ function KaizenTradeTemplate(){
           headers.forEach(function(h,hi){ obj[h]=(cols[hi]||'').replace(/^"|"$/g,''); });
           return obj;
         }).filter(function(r){return r.EnteredAt||r.EntryPrice;});
-
-        if(rows.length===0){ window.alert("No valid trades found in CSV. Check column names (EnteredAt, EntryPrice, ExitPrice, PnL, Type, Size)."); return; }
-
+        if(rows.length===0){ window.alert("No valid trades found. Expected columns: EnteredAt, EntryPrice, ExitPrice, PnL, Type, Size."); return; }
         const byDay={};
         rows.forEach(function(r){
           const raw=r.TradeDay||r.EnteredAt||'';
@@ -1772,7 +1717,6 @@ function KaizenTradeTemplate(){
           if(!byDay[day])byDay[day]=[];
           byDay[day].push(r);
         });
-
         const newSessions=Object.entries(byDay).sort().map(function(entry){
           const day=entry[0], dayTrades=entry[1];
           const sessionTrades=dayTrades.map(function(r){
@@ -1802,30 +1746,20 @@ function KaizenTradeTemplate(){
             _csvImported: true,
           });
         });
-
-        const msg = "Import " + newSessions.length + " day(s) / " + rows.length + " trade(s) from CSV?\n\nCommission applied: $" + MNQ_COMMISSION_RT + " per round trip ($0.62/side x2).\nBroker PnL adjusted to your net automatically.\n\nExisting archived sessions will be kept.";
+        const msg = "Import " + newSessions.length + " day(s) / " + rows.length + " trade(s) from CSV?\n\nCommission $" + MNQ_COMMISSION_RT + " ($0.62/side x2) auto-deducted per trade.\nExisting sessions kept.";
         if(!window.confirm(msg)){ e.target.value=''; return; }
-
         const merged = history.concat(newSessions);
         setHistory(merged);
         saveAllSessions(merged);
         sfx('save');
         setView('dashboard');
-        window.alert("Imported! " + newSessions.length + " session(s), " + rows.length + " trade(s). Commission $" + MNQ_COMMISSION_RT + " deducted per trade. Check ANALYTICS DASHBOARD.");
+        window.alert("Imported " + newSessions.length + " session(s), " + rows.length + " trade(s). Net P&L shown after $" + MNQ_COMMISSION_RT + " commission.");
       } catch(err){
         window.alert("CSV import failed: "+err.message);
       }
     };
     reader.readAsText(file);
     e.target.value='';
-  };
-
-  const clearDashboard=()=>{
-    if(!window.confirm("⚠️ Delete ALL archived sessions from the dashboard?\n\nThis cannot be undone. Export a backup first!")) return;
-    saveAllSessions([]);
-    setHistory([]);
-    sfx("remove");
-    window.alert("Dashboard cleared.");
   };
 
   const switchView=(v)=>{ sfx("open"); setView(v); };
@@ -1854,17 +1788,13 @@ function KaizenTradeTemplate(){
           {draftSaved&&<span style={{color:"#eab308",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT SAVED</span>}
           {draftLoaded&&<span style={{color:"#6366f1",fontSize:10,fontFamily:"monospace"}}>✓ DRAFT LOADED</span>}
           <button id="print-btn" onClick={()=>{sfx("tap");window.print();}} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>⬇ PRINT / SAVE PDF</button>
-          <button onClick={saveDraft} style={{...hdrBtn,borderColor:"#eab308",color:"#fde047"}}>💾 SAVE DRAFT</button>
+          <button onClick={saveDraft} style={{...hdrBtn,borderColor:"#eab308",color:"#fde047"}}>SAVE DRAFT</button>
           <button onClick={loadDraft} style={{...hdrBtn,borderColor:"#6366f1",color:"#a5b4fc"}}>LOAD DRAFT</button>
           <button onClick={()=>switchView("session")} style={{...hdrBtn,borderColor:view==="session"?"#2563ff":"#3f3f46",color:view==="session"?"#fff":"#a1a1aa"}}>LOG WORKSPACE</button>
           <button onClick={()=>switchView("summary")} style={{...hdrBtn,borderColor:view==="summary"?"#2563ff":"#3f3f46",color:view==="summary"?"#fff":"#a1a1aa"}}>VIEW SUMMARY</button>
           <button onClick={()=>switchView("dashboard")} style={{...hdrBtn,borderColor:view==="dashboard"?"#2563ff":"#3f3f46",color:view==="dashboard"?"#fff":"#a1a1aa"}}>ANALYTICS DASHBOARD</button>
-          <button onClick={doExportBackup} style={{...hdrBtn,borderColor:"#22d3ee",color:"#67e8f9"}}>📦 EXPORT BACKUP</button>
-          <label style={{...hdrBtn,borderColor:"#f97316",color:"#fdba74",cursor:"pointer",display:"inline-block"}}>📥 IMPORT BACKUP<input type="file" accept=".json" onChange={doImportBackup} style={{display:"none"}}/></label>
+          <button id="archive-btn" onClick={commitSessionToHistory} style={{...hdrBtn,borderColor:"#10b981",color:"#6ee7b7"}}>ARCHIVE SESSION</button>
           <label style={{...hdrBtn,borderColor:"#34d399",color:"#6ee7b7",cursor:"pointer",display:"inline-block"}}>📊 IMPORT CSV<input type="file" accept=".csv" onChange={doImportCSV} style={{display:"none"}}/></label>
-          <button onClick={clearDashboard} style={{...hdrBtn,borderColor:"#7f1d1d",color:"#fca5a5"}}>🗑 CLEAR DASHBOARD</button>
-          <span style={{color:"#3f3f46",userSelect:"none",padding:"0 4px"}}>│</span>
-          <button id="archive-btn" onClick={commitSessionToHistory} style={{...hdrBtn,borderColor:"#10b981",color:"#6ee7b7"}}>🗂 ARCHIVE SESSION</button>
           <button onClick={resetSession} style={{...hdrBtn,color:"#71717a"}}>NEW SESSION</button>
         </div>
       </div>
@@ -1954,20 +1884,12 @@ function KaizenTradeTemplate(){
             {session.trades.map((trade,i)=>(
               <TradeCard key={trade.id} trade={trade} index={i} onChange={updated=>updateTrade(trade.id,updated)} onRemove={()=>removeTrade(trade.id)}/>
             ))}
-            <div style={{display:"flex",gap:"8px",marginBottom:"24px"}}>
-              <button onClick={addTrade}
-                style={{flex:1,background:"none",border:"1px dashed #3f3f46",color:"#52525b",padding:"12px",borderRadius:"8px",fontSize:"12px",cursor:"pointer"}}
-                onMouseOver={e=>{e.target.style.borderColor="#a1a1aa";e.target.style.color="#a1a1aa";}}
-                onMouseOut={e=>{e.target.style.borderColor="#3f3f46";e.target.style.color="#52525b";}}>
-                + ADD TRADE TO LOG
-              </button>
-              <button onClick={saveDraft}
-                style={{background:"none",border:"1px solid #eab308",color:"#fde047",padding:"12px 20px",borderRadius:"8px",fontSize:"11px",cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'JetBrains Mono',monospace"}}
-                onMouseOver={e=>e.currentTarget.style.background="#1a1500"}
-                onMouseOut={e=>e.currentTarget.style.background="none"}>
-                💾 SAVE DRAFT
-              </button>
-            </div>
+            <button onClick={addTrade}
+              style={{width:"100%",background:"none",border:"1px dashed #3f3f46",color:"#52525b",padding:"12px",borderRadius:"8px",fontSize:"12px",cursor:"pointer",marginBottom:"24px"}}
+              onMouseOver={e=>{e.target.style.borderColor="#a1a1aa";e.target.style.color="#a1a1aa";}}
+              onMouseOut={e=>{e.target.style.borderColor="#3f3f46";e.target.style.color="#52525b";}}>
+              + ADD TRADE TO LOG
+            </button>
 
             {/* Trades Avoided */}
             <TradesAvoided avoided={avoided} setAvoided={setAvoided}/>
@@ -2027,7 +1949,7 @@ function KaizenTradeTemplate(){
 
         {/* Footer */}
         <div style={{marginTop:"32px",borderTop:"1px solid #27272a",paddingTop:"16px",color:"#52525b",fontSize:"10px",textAlign:"center"}}>
-          Kaizen Log v6.0 — MNQ · $0.62/side commission auto-applied on CSV import · ✅ Winner · ⭐ Manual Exit · ⏹ Small Stop · 🔺 Hard Stop · The account staying open is the win condition.
+          Kaizen Log v4.1.3 · ✅ Winner · ⭐ Manual Exit · ⏹ Small Stop · 🔺 Hard Stop · The account staying open is the win condition.
         </div>
       </div>
     </div>
