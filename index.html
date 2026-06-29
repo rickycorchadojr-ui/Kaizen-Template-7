@@ -1713,9 +1713,7 @@ function KaizenTradeTemplate(){
         const payload = JSON.parse(ev.target.result);
         const sessionList = Array.isArray(payload.sessions) ? payload.sessions : [];
         const hasDraft = payload.draft && payload.draft.session;
-        if(!window.confirm("Import backup? This replaces your current archived sessions.
-
-• "+sessionList.length+" archived session(s)
+        if(!window.confirm("Import backup? This replaces your current archived sessions.\n\n• "+sessionList.length+" archived session(s)
 "+(hasDraft?"• Saved workspace will be restored
 ":""))) {
           e.target.value=""; return;
@@ -1739,7 +1737,7 @@ function KaizenTradeTemplate(){
     e.target.value="";
   };
 
-  const MNQ_COMMISSION_RT = 1.24; // $0.62 per side × 2 = $1.24 round trip
+  const MNQ_COMMISSION_RT = 1.24;
 
   const doImportCSV=(e)=>{
     const file = e.target.files[0];
@@ -1747,42 +1745,44 @@ function KaizenTradeTemplate(){
     const reader = new FileReader();
     reader.onload=(ev)=>{
       try{
-        const lines = ev.target.result.split(/\r?\n/).filter(l=>l.trim());
+        const text = ev.target.result;
+        const lines = text.split(/[\r\n]+/).filter(function(l){return l.trim();});
         if(lines.length < 2){ window.alert("CSV appears empty."); return; }
-        const headers = lines[0].split(',').map(h=>h.trim().replace(/^"|"$/g,''));
-        const rows = lines.slice(1).map(line=>{
-          const cols=[];let cur='',inQ=false;
-          for(let i=0;i<line.length;i++){
-            if(line[i]==='"'){inQ=!inQ;}
-            else if(line[i]===','&&!inQ){cols.push(cur);cur='';}
-            else cur+=line[i];
+        const headers = lines[0].split(',').map(function(h){return h.trim().replace(/^"|"$/g,'');});
+        const rows = lines.slice(1).map(function(line){
+          const cols=[];
+          let cur='', inQ=false;
+          for(let ci=0;ci<line.length;ci++){
+            if(line[ci]==='"'){inQ=!inQ;}
+            else if(line[ci]===','&&!inQ){cols.push(cur);cur='';}
+            else cur+=line[ci];
           }
           cols.push(cur);
           const obj={};
-          headers.forEach((h,i)=>{ obj[h]=cols[i]?.replace(/^"|"$/g,'')||''; });
+          headers.forEach(function(h,hi){ obj[h]=(cols[hi]||'').replace(/^"|"$/g,''); });
           return obj;
-        }).filter(r=>r.EnteredAt||r.EntryPrice);
+        }).filter(function(r){return r.EnteredAt||r.EntryPrice;});
 
-        // Group by TradeDay (or date portion of EnteredAt)
+        if(rows.length===0){ window.alert("No valid trades found in CSV. Check column names (EnteredAt, EntryPrice, ExitPrice, PnL, Type, Size)."); return; }
+
         const byDay={};
-        rows.forEach(r=>{
+        rows.forEach(function(r){
           const raw=r.TradeDay||r.EnteredAt||'';
           const day=raw.slice(0,10);
           if(!byDay[day])byDay[day]=[];
           byDay[day].push(r);
         });
 
-        const newSessions=Object.entries(byDay).sort().map(([day,trades])=>{
-          const sessionTrades=trades.map(r=>{
+        const newSessions=Object.entries(byDay).sort().map(function(entry){
+          const day=entry[0], dayTrades=entry[1];
+          const sessionTrades=dayTrades.map(function(r){
             const enteredAt=r.EnteredAt||'';
-            const timeMatch=enteredAt.match(/\d{2}:\d{2}/);
-            const timeStr=timeMatch?timeMatch[0]:'';
+            const const timeParts=enteredAt.match(/([0-9]{2}:[0-9]{2})/);/);
+            const timeStr=timeParts?timeParts[1]:'';
             const pnlRaw=parseFloat(r.PnL||r.pnl||0);
-            // PnL from broker is after their fee structure; we display net after our commission
             const pnlNet=(pnlRaw - MNQ_COMMISSION_RT).toFixed(2);
             const dir=(r.Type||r.type||'').toLowerCase();
-            return {
-              ...emptyTrade(),
+            return Object.assign({}, emptyTrade(), {
               id: Date.now()+Math.random(),
               time: timeStr,
               entry: r.EntryPrice||r.entryPrice||'',
@@ -1793,28 +1793,27 @@ function KaizenTradeTemplate(){
               _csvImported: true,
               _brokerPnL: pnlRaw,
               _commission: MNQ_COMMISSION_RT,
-            };
+            });
           });
-          return {
-            ...emptySession(),
+          return Object.assign({}, emptySession(), {
             id: Date.now()+Math.random(),
             date: day,
             trades: sessionTrades,
             _csvImported: true,
-          };
+          });
         });
 
-        const msg = `Import ${newSessions.length} day(s) / ${rows.length} trade(s) from CSV?\n\nCommission applied: $${MNQ_COMMISSION_RT} per round trip ($.62/side × 2).\nBroker P&L adjusted to your net P&L automatically.\n\nExisting archived sessions will be kept.`;
+        const msg = "Import " + newSessions.length + " day(s) / " + rows.length + " trade(s) from CSV?\n\nCommission applied: $" + MNQ_COMMISSION_RT + " per round trip ($0.62/side x2).\nBroker PnL adjusted to your net automatically.\n\nExisting archived sessions will be kept.";
         if(!window.confirm(msg)){ e.target.value=''; return; }
 
-        const merged=[...history, ...newSessions];
+        const merged = history.concat(newSessions);
         setHistory(merged);
         saveAllSessions(merged);
         sfx('save');
         setView('dashboard');
-        window.alert(\`✅ Imported! \${newSessions.length} session(s), \${rows.length} trade(s). Commission $\${MNQ_COMMISSION_RT} deducted per trade. Check ANALYTICS DASHBOARD.\`);
+        window.alert("Imported! " + newSessions.length + " session(s), " + rows.length + " trade(s). Commission $" + MNQ_COMMISSION_RT + " deducted per trade. Check ANALYTICS DASHBOARD.");
       } catch(err){
-        window.alert("❌ CSV import failed: "+err.message);
+        window.alert("CSV import failed: "+err.message);
       }
     };
     reader.readAsText(file);
@@ -1822,9 +1821,7 @@ function KaizenTradeTemplate(){
   };
 
   const clearDashboard=()=>{
-    if(!window.confirm("⚠️ Delete ALL archived sessions from the dashboard?
-
-This cannot be undone. Export a backup first!")) return;
+    if(!window.confirm("⚠️ Delete ALL archived sessions from the dashboard?\n\nThis cannot be undone. Export a backup first!")) return;
     saveAllSessions([]);
     setHistory([]);
     sfx("remove");
