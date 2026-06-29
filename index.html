@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Kaizen Trade Quest — Session Log & Analytics Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://fonts.gstatic.com">
 <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Baloo+2:wght@500;600;700;800&family=Press+Start+2P&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.10.3/Recharts.js"></script>
 <style>
 /* ════════════════════════════════════════════════════════════
    KAIZEN TRADE QUEST — visual theme
@@ -1640,7 +1640,7 @@ function KaizenTradeTemplate(){
   const [saved,setSaved]=useState(false);
   const [draftSaved,setDraftSaved]=useState(false);
   const [draftLoaded,setDraftLoaded]=useState(false);
-  const [booting,setBooting]=useState(true);
+  // boot screen removed
   const [celebrate,setCelebrate]=useState(false);
 
 
@@ -1796,10 +1796,6 @@ This cannot be undone. Export a backup first if you want to keep your data.")) r
   const envBtn=(active)=>({padding:"6px 14px",border:`1px solid ${active?"#6366f1":"#3f3f46"}`,borderRadius:"4px",background:active?"#1e1b4b":"#18181b",color:active?"#a5b4fc":"#71717a",fontSize:"11px",cursor:"pointer"});
   const yesNoBtn=(active,isYes)=>({padding:"6px 16px",border:`1px solid ${active?(isYes?"#10b981":"#ef4444"):"#3f3f46"}`,borderRadius:"4px",background:active?(isYes?"#064e3b":"#450a0a"):"#18181b",color:active?(isYes?"#6ee7b7":"#fca5a5"):"#71717a",fontSize:"11px",cursor:"pointer"});
   const envCorrectBtn=(v,active)=>({padding:"6px 14px",border:`1px solid ${active?(v===true?"#10b981":v===false?"#ef4444":"#eab308"):"#3f3f46"}`,borderRadius:"4px",background:active?(v===true?"#064e3b":v===false?"#450a0a":"#422006"):"#18181b",color:active?(v===true?"#6ee7b7":v===false?"#fca5a5":"#fde047"):"#71717a",fontSize:"11px",cursor:"pointer"});
-
-  if(booting){
-    return <BootScreen onDone={()=>setBooting(false)}/>;
-  }
 
   return(
     <div style={{background:"#0a0a0a",minHeight:"100vh",fontFamily:"'JetBrains Mono','Courier New',monospace"}}>
